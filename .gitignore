@@ -1,0 +1,20 @@
+# Keil MDK 构建输出
+MDK-ARM/LH001-91/
+MDK-ARM/build_log.txt
+MDK-ARM/*.uvguix.*
+MDK-ARM/JLinkLog.txt
+MDK-ARM/EventRecorderStub.scvd
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 运行日志
+pyside6_app/log.txt
+*.log
+
+# 系统文件
+Thumbs.db
+.DS_Store
