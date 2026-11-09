@@ -185,19 +185,37 @@ static void LH001_91_App_Init(void)
     lh001_91_write_regs_dual(LH001_91_CHIP_SLAVE, ADDR_LH001_91_USERKEY, &userkey_val, 1);
     lh001_91_write_regs_dual(LH001_91_CHIP_SLAVE, ADDR_LH001_91_CLKCON, &clkcon_val, 1);
 
-    // 2. 初始化导联脱落检测 (LOCON2 = 0x18, LOCON3 = 0x00)
-    LH001_91_LEADOFF_t leadoff_init;
-    leadoff_init.threshold = LH001_91_LEADOFF_DELTA_4;
-    leadoff_init.current = LH001_91_LEADOFF_CURRENT_SOURCE_50nA;
-    leadoff_init.sink_cfg = LH001_91_LEADOFF_SINK_CLOSE;
-    leadoff_init.source_cfg = LH001_91_LEADOFF_SOURCE_CLOSE;
-    leadoff_init.rld_sink_en = 0;
-    leadoff_init.ain0_detect_en = 0;
-    leadoff_init.ain1_detect_en = 0;
-    leadoff_init.rld_detect_en = 0;
+    // 2. 初始化导联脱落检测: 主从共用 LOCON1 (直流激励电流 100nA, 阈值系数 n=16, LOCON1 = 0x4F)
+    LH001_91_LEADOFF_t leadoff_base = {
+        .threshold = LH001_91_LEADOFF_THRESHOLD_N16,
+        .current = LH001_91_LEADOFF_CURRENT_100NA,
+        .sink_cfg = LH001_91_LEADOFF_SINK_NONE,
+        .source_cfg = LH001_91_LEADOFF_SOURCE_NONE,
+        .rld_sink_en = 0,
+        .ain0_detect_en = 0,
+        .ain1_detect_en = 0,
+        .rld_detect_en = 0,
+    };
+    LH001_91_LEADOFF_t leadoff_master = leadoff_base;
+    LH001_91_LEADOFF_t leadoff_slave = leadoff_base;
 
-    lh001_91_leadoff_init_dual(LH001_91_CHIP_MASTER, &leadoff_init);
-    lh001_91_leadoff_init_dual(LH001_91_CHIP_SLAVE, &leadoff_init);
+    //    主片 (LA/RA/RLDOUT): AIN0 拉电流 + AIN1 灌电流 + RLDOUT 灌电流 (LOCON2 = 0x34),
+    //    AIN0/AIN1/RLDOUT 三通道直流脱落检测全开 (LOCON3 = 0x07)
+    leadoff_master.source_cfg = LH001_91_LEADOFF_SOURCE_AIN0;
+    leadoff_master.sink_cfg = LH001_91_LEADOFF_SINK_AIN1;
+    leadoff_master.rld_sink_en = 1;
+    leadoff_master.ain0_detect_en = 1;
+    leadoff_master.ain1_detect_en = 1;
+    leadoff_master.rld_detect_en = 1;
+
+    //    从片 (LL + 复用主片 RA): 仅 AIN0 拉电流, AIN1/RLD 激励关闭 (LOCON2 = 0x10),
+    //    使能 AIN0/AIN1 检测, 关闭 RLD 检测 (LOCON3 = 0x05)
+    leadoff_slave.source_cfg = LH001_91_LEADOFF_SOURCE_AIN0;
+    leadoff_slave.ain0_detect_en = 1;
+    leadoff_slave.ain1_detect_en = 1;
+
+    lh001_91_leadoff_init_dual(LH001_91_CHIP_MASTER, &leadoff_master);
+    lh001_91_leadoff_init_dual(LH001_91_CHIP_SLAVE, &leadoff_slave);
 
     // 3. 初始化主从机右腿驱动 RLDCON (主机=0x05, 从机=0x01)
     lh001_91_rld_init_dual(LH001_91_CHIP_MASTER, 1, ENUM_LH001_91_RLD_REF_AVDD_DIV2, ENUM_LH001_91_RLD_CHOP_FMOD_DIV32);
@@ -231,11 +249,7 @@ static void LH001_91_App_Init(void)
     // 6. 配置主从芯片的 ADC 通道 (ADCCHCON=0x10)
     lh001_91_adc_channel_dual(LH001_91_CHIP_MASTER, ENUM_LH001_91_ADCCHP_AIN0, ENUM_LH001_91_ADCCHN_AIN1);
     lh001_91_adc_channel_dual(LH001_91_CHIP_SLAVE, ENUM_LH001_91_ADCCHP_AIN0, ENUM_LH001_91_ADCCHN_AIN1);
-	
-    // 7. 显式修改主从器件的 LOCON3=0x00
-    uint8_t locon3_val = 0x00;
-    lh001_91_write_regs_dual(LH001_91_CHIP_MASTER, ADDR_LH001_91_LOCON3, &locon3_val, 1);
-    lh001_91_write_regs_dual(LH001_91_CHIP_SLAVE, ADDR_LH001_91_LOCON3, &locon3_val, 1);
+
 
     // 读取寄存器Dump数组进行校验打印
     lh001_91_read_regs_dual(LH001_91_CHIP_MASTER, ADDR_LH001_91_CONFIG1, &master_regs[0], 1);

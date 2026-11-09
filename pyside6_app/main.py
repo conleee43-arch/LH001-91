@@ -11,13 +11,52 @@ import sys
 import time
 import re
 import queue
+import traceback
+import multiprocessing
 from datetime import datetime
 import numpy as np
 import serial
 import serial.tools.list_ports
 
-# 日志文件存储路径（自动在 pyside6_app 目录下生成 log.txt）
-LOG_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log.txt")
+
+def get_base_dir() -> str:
+    """获取资源文件所在目录（兼容 PyInstaller 单文件打包环境中的临时解压目录）"""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_app_dir() -> str:
+    """获取程序运行工作目录（打包后为 exe 所在目录，源码运行为 main.py 所在目录）"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+# 日志文件存储路径（持久化保存在 exe/脚本 同级目录下）
+LOG_FILE_PATH = os.path.join(get_app_dir(), "log.txt")
+STARTUP_LOG_PATH = os.path.join(get_app_dir(), "startup.log")
+
+try:
+    with open(STARTUP_LOG_PATH, "a", encoding="utf-8") as _f:
+        _f.write(f"[{datetime.now()}] Module main.py loading...\n")
+except Exception:
+    pass
+
+
+def log_uncaught_exceptions(ex_cls, ex, tb):
+    err = "".join(traceback.format_exception(ex_cls, ex, tb))
+    print("CRITICAL ERROR:", err, file=sys.stderr)
+    try:
+        crash_log = os.path.join(get_app_dir(), "crash.log")
+        with open(crash_log, "a", encoding="utf-8") as f:
+            f.write(f"\n[{datetime.now()}] Uncaught Exception:\n" + err + "\n")
+    except Exception:
+        pass
+    sys.__excepthook__(ex_cls, ex, tb)
+
+
+sys.excepthook = log_uncaught_exceptions
 
 from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer
 from PySide6.QtWidgets import (
@@ -25,8 +64,9 @@ from PySide6.QtWidgets import (
     QGridLayout, QGroupBox, QLabel, QComboBox, QPushButton, QCheckBox,
     QTextEdit, QFrame, QSplitter, QFileDialog
 )
-from PySide6.QtGui import QFont, QTextCursor
+from PySide6.QtGui import QFont, QTextCursor, QIcon
 
+os.environ["PYQTGRAPH_QT_LIB"] = "PySide6"
 import pyqtgraph as pg
 
 # Configure pyqtgraph for dark aesthetic matching medical standard
@@ -113,7 +153,7 @@ def crc16(data: bytes) -> int:
 
 def decode_samples(arr: np.ndarray) -> tuple[np.ndarray, int]:
     """
-    向量化解码单芯片的 N 个 6 字节样本，返回 (codes, 最后一个样本的 loffstat)。
+    向量化解码单芯片的 N 个 6 字节样本，返回 (codes, 该批次按位或融合的 loffstat)。
     """
     codes = (((arr[:, 2].astype(np.int32) & 0x03) << 22)
              | (arr[:, 3].astype(np.int32) << 14)
@@ -122,8 +162,10 @@ def decode_samples(arr: np.ndarray) -> tuple[np.ndarray, int]:
     # 24 位有符号数扩展
     codes = np.where(codes & 0x800000, codes - 0x1000000, codes).astype(np.int32)
 
-    last_loff = int(((arr[-1, 0] & 0x0F) << 2) | (arr[-1, 1] >> 6))
-    return codes, last_loff
+    # 批次内全部样本按位或融合，防止 50Hz 工频感应造成的单点漏报
+    loff_arr = ((arr[:, 0].astype(np.int32) & 0x0F) << 2) | (arr[:, 1].astype(np.int32) >> 6)
+    merged_loff = int(np.bitwise_or.reduce(loff_arr))
+    return codes, merged_loff
 
 
 def decode_payload(payload: bytes, slot_count: int) -> tuple[np.ndarray, np.ndarray, int, int]:
@@ -138,20 +180,52 @@ def decode_payload(payload: bytes, slot_count: int) -> tuple[np.ndarray, np.ndar
     return m_codes, s_codes, m_loff, s_loff
 
 
-def format_loffstat(loff: int) -> tuple[str, str]:
-    """Returns (display_text, color_hex) for Lead-off status."""
+def format_loffstat(loff: int, is_slave: bool = False) -> tuple[str, str]:
+    """Returns (display_text, color_hex) for Lead-off status with electrode mapping."""
     if loff == 0:
         return "正常 (连接良好)", "#00e676"  # Green
 
     details = []
-    if loff & 0x01: details.append("AIN0+")
-    if loff & 0x02: details.append("AIN0-")
-    if loff & 0x04: details.append("AIN1+")
-    if loff & 0x08: details.append("AIN1-")
+    if loff & 0x01: details.append("LL (AIN0+)" if is_slave else "LA (AIN0+)")
+    if loff & 0x02: details.append("LL (AIN0-)" if is_slave else "LA (AIN0-)")
+    if loff & 0x04: details.append("RA (AIN1+)")
+    if loff & 0x08: details.append("RA (AIN1-)")
     if loff & 0x10: details.append("RLD")
+    if loff & 0x20: details.append("RLD-")
 
     desc = ", ".join(details) if details else f"0x{loff:02X}"
     return f"导联脱落 [{desc}]", "#ff3366"  # Red/Pink
+
+
+# =====================================================================
+# LEAD-OFF DEBOUNCER (0.4s Hysteresis Hold-off Filter)
+# =====================================================================
+class LeadOffDebouncer:
+    """
+    导联脱落状态消抖器 (带时间滞后保持)：
+    - 解决悬空导联线受空间 50Hz 工频/杂散电荷感应导致的脱落位高频跳变。
+    - 只要检测到脱落位置 1，立即置位并维持 hold_time 秒（默认 0.4s）。
+    - 连续超过 hold_time 未检测到脱落脉冲，才自动恢复为正常连接。
+    """
+    def __init__(self, hold_time_sec: float = 0.4):
+        self.hold_time_sec = hold_time_sec
+        self.last_trigger_times = np.zeros(6, dtype=np.float64)
+
+    def update(self, raw_loff: int) -> int:
+        now = time.monotonic()
+        for bit in range(6):
+            if (raw_loff >> bit) & 1:
+                self.last_trigger_times[bit] = now
+
+        filtered_loff = 0
+        for bit in range(6):
+            if (now - self.last_trigger_times[bit]) < self.hold_time_sec:
+                filtered_loff |= (1 << bit)
+
+        return filtered_loff
+
+    def reset(self):
+        self.last_trigger_times.fill(0.0)
 
 
 # =====================================================================
@@ -453,7 +527,14 @@ class SerialReceiverThread(QThread):
         """Streams ECG samples directly from ecg_standard_data.csv at 1000Hz."""
         csv_file_path = self.csv_path
         if not csv_file_path or not os.path.exists(csv_file_path):
-            csv_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ecg_standard_data.csv")
+            cand_local = os.path.join(get_app_dir(), "ecg_standard_data.csv")
+            cand_bundle = os.path.join(get_base_dir(), "ecg_standard_data.csv")
+            if os.path.exists(cand_local):
+                csv_file_path = cand_local
+            elif os.path.exists(cand_bundle):
+                csv_file_path = cand_bundle
+            else:
+                csv_file_path = cand_local
 
         if not os.path.exists(csv_file_path):
             self.connection_status.emit(False, f"CSV 文件不存在: {csv_file_path}")
@@ -673,6 +754,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("LH001-91 双芯片 6 肢体导联心电上位机工作站 (PySide6)")
         self.resize(1280, 850)
 
+        icon_path = os.path.join(get_base_dir(), "app_icon.ico")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+
         # Plot parameters: 4000 points ring buffer = 4 seconds window at 1000Hz
         self.buffer_size = 4000
         self.master_code_buf = np.zeros(self.buffer_size, dtype=np.float64)
@@ -680,6 +765,10 @@ class MainWindow(QMainWindow):
         self.custom_csv_path = None
         # Real-time DSP Filter (1000Hz)
         self.ecg_filter = ECGFilter(fs=1000.0)
+
+        # 导联脱落消抖器 (0.4秒滞后保持)
+        self.m_debouncer = LeadOffDebouncer(hold_time_sec=0.4)
+        self.s_debouncer = LeadOffDebouncer(hold_time_sec=0.4)
 
         # Thread-safe queue for decoupling receiver thread from GUI render loop
         self.data_queue = queue.Queue()
@@ -1066,6 +1155,9 @@ class MainWindow(QMainWindow):
             self.receiver_thread.stop()
             self.receiver_thread = None
 
+            self.m_debouncer.reset()
+            self.s_debouncer.reset()
+
             self.toggle_conn_btn.setText("打开采集")
             self.toggle_conn_btn.setObjectName("open_btn")
             self.toggle_conn_btn.setStyle(self.toggle_conn_btn.style())
@@ -1097,6 +1189,9 @@ class MainWindow(QMainWindow):
                     self.data_queue.get_nowait()
                 except queue.Empty:
                     break
+
+            self.m_debouncer.reset()
+            self.s_debouncer.reset()
 
             self.receiver_thread = SerialReceiverThread(
                 port, baud, self.data_queue, parse_mode, csv_path=self.custom_csv_path
@@ -1130,21 +1225,23 @@ class MainWindow(QMainWindow):
             self.btn_select_csv.setEnabled(True)
             self.btn_select_csv.setVisible(is_csv)
             self.parse_mode_combo.setEnabled(True)
+            self.m_debouncer.reset()
+            self.s_debouncer.reset()
 
     def process_queued_data(self):
         """Timer callback (30 FPS) to consume data queue and update GUI smoothly."""
         master_list = []
         slave_list = []
-        latest_m_loff = 0
-        latest_s_loff = 0
+        accum_m_loff = 0
+        accum_s_loff = 0
 
         for _ in range(MAX_QUEUE_ITEMS):
             try:
                 m_codes, s_codes, m_loff, s_loff = self.data_queue.get_nowait()
                 master_list.append(m_codes)
                 slave_list.append(s_codes)
-                latest_m_loff = m_loff
-                latest_s_loff = s_loff
+                accum_m_loff |= m_loff
+                accum_s_loff |= s_loff
             except queue.Empty:
                 break
 
@@ -1164,21 +1261,23 @@ class MainWindow(QMainWindow):
         latest_m_mv = code_to_mv(latest_m_code)
         latest_s_mv = code_to_mv(latest_s_code)
 
-        # Update Master Label
+        # Update Master Label (带消抖滤波)
         m_hex_str = f"0x{latest_m_code & 0xFFFFFF:06X}" if latest_m_code >= 0 else f"-0x{abs(latest_m_code) & 0xFFFFFF:06X}"
         self.master_code_val.setText(f"{latest_m_code}\n({m_hex_str})")
         self.master_mv_val.setText(f"{latest_m_mv:.3f} mV")
 
-        m_loff_text, m_loff_color = format_loffstat(latest_m_loff)
+        filtered_m_loff = self.m_debouncer.update(accum_m_loff)
+        m_loff_text, m_loff_color = format_loffstat(filtered_m_loff, is_slave=False)
         self.master_loff_val.setText(m_loff_text)
         self.master_loff_val.setStyleSheet(f"color: {m_loff_color}; font-size: 12px; font-weight: bold;")
 
-        # Update Slave Label
+        # Update Slave Label (带消抖滤波)
         s_hex_str = f"0x{latest_s_code & 0xFFFFFF:06X}" if latest_s_code >= 0 else f"-0x{abs(latest_s_code) & 0xFFFFFF:06X}"
         self.slave_code_val.setText(f"{latest_s_code}\n({s_hex_str})")
         self.slave_mv_val.setText(f"{latest_s_mv:.3f} mV")
 
-        s_loff_text, s_loff_color = format_loffstat(latest_s_loff)
+        filtered_s_loff = self.s_debouncer.update(accum_s_loff)
+        s_loff_text, s_loff_color = format_loffstat(filtered_s_loff, is_slave=True)
         self.slave_loff_val.setText(s_loff_text)
         self.slave_loff_val.setStyleSheet(f"color: {s_loff_color}; font-size: 12px; font-weight: bold;")
 
@@ -1276,10 +1375,24 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    multiprocessing.freeze_support()
+    def slog(msg):
+        print(f"[STARTUP] {msg}", flush=True)
+        try:
+            with open(STARTUP_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now()}] {msg}\n")
+        except Exception:
+            pass
+
+    slog("1. Entering main()")
     app = QApplication(sys.argv)
+    slog("2. QApplication created")
     app.setStyle('Fusion')
+    slog("3. Style set, creating MainWindow")
     window = MainWindow()
+    slog("4. MainWindow created, calling show()")
     window.show()
+    slog("5. window.show() completed, entering app.exec()")
     sys.exit(app.exec())
 
 

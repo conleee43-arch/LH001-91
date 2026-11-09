@@ -179,10 +179,23 @@ extern "C" {
 #define ENUM_LH001_91_ADC_FMODCLK_128K      16
 #define ENUM_LH001_91_ADC_DR_DIV128         3
 
-#define LH001_91_LEADOFF_DELTA_4            3
-#define LH001_91_LEADOFF_CURRENT_SOURCE_50nA 3
-#define LH001_91_LEADOFF_SINK_CLOSE         0
-#define LH001_91_LEADOFF_SOURCE_CLOSE       3
+/* LOCON1.THRESHOLD[3:0] 比较器阈值系数, 编码 n-1: 0xF 对应 n=16 */
+#define LH001_91_LEADOFF_THRESHOLD_N16      0x0F
+
+/* LOCON1.CURRENT[6:4] 直流激励电流档位 */
+#define LH001_91_LEADOFF_CURRENT_100NA      4
+
+/* LOCON2.SINKEN[2:1] 灌电流(sink)通道使能: bit1=AIN0, bit2=AIN1 */
+#define LH001_91_LEADOFF_SINK_NONE          0x0
+#define LH001_91_LEADOFF_SINK_AIN0          0x1
+#define LH001_91_LEADOFF_SINK_AIN1          0x2
+#define LH001_91_LEADOFF_SINK_BOTH          0x3
+
+/* LOCON2.SOURCEENB[4:3] 拉电流(source)通道使能: bit3=AIN1, bit4=AIN0 */
+#define LH001_91_LEADOFF_SOURCE_NONE        0x0
+#define LH001_91_LEADOFF_SOURCE_AIN1        0x1
+#define LH001_91_LEADOFF_SOURCE_AIN0        0x2
+#define LH001_91_LEADOFF_SOURCE_BOTH        0x3
 
 /*******************************************************************************
  * Type Definitions & Structures
